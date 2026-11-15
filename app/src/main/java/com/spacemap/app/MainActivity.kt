@@ -1,5 +1,4 @@
 package com.spacemap.app
-
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
@@ -18,6 +17,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.StatFs
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.text.TextUtils
 import android.view.Gravity
@@ -34,13 +34,13 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.FileProvider
+import androidx.documentfile.provider.DocumentFile
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-
 private object C {
     val BG = 0xFF0B1220.toInt()
     val CARD = 0xFF131C2E.toInt()
@@ -55,15 +55,12 @@ private object C {
     val AMBER = 0xFFF59E0B.toInt()
     val RED = 0xFFEF4444.toInt()
 }
-
 class MainActivity : Activity() {
-
     private val disk = Disk()
     private val ui = Handler(Looper.getMainLooper())
     private val df = SimpleDateFormat("yyyy-MM-dd", Locale.US)
     private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
     private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
-
     private var pool: ExecutorService? = null
     private var cur = File("/")
     private var entries = ArrayList<Entry>()
@@ -76,7 +73,9 @@ class MainActivity : Activity() {
     private var requested = false
     private var scheduled = false
     private var protectedDir = false
-
+    private val docCache = HashMap<String, DocumentFile>()
+    private var curDoc: DocumentFile? = null
+    private val REQ_SAF = 501
     private lateinit var crumbs: LinearLayout
     private lateinit var crumbScroll: HorizontalScrollView
     private lateinit var stats: LinearLayout
@@ -88,37 +87,42 @@ class MainActivity : Activity() {
     private lateinit var selText: TextView
     private lateinit var sortBtn: TextView
     private lateinit var selAllBtn: TextView
-
+    private lateinit var safBtn: TextView
+    private lateinit var safTip: TextView
     private val adapter = Adapter()
     private val refreshRun = Runnable {
         scheduled = false
         refresh()
     }
-
-    // ───────────────────────── lifecycle & permissions ─────────────────────────
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(buildUi())
     }
-
     override fun onResume() {
         super.onResume()
         if (hasAccess()) {
             if (!started) {
                 started = true
+                loadSafGrants()
                 go(Environment.getExternalStorageDirectory())
             }
         } else if (!asking) {
             askAccess()
         }
     }
-
+    private fun loadSafGrants() {
+        for ((path, uri) in Saf.all(this)) {
+            try {
+                val d = DocumentFile.fromTreeUri(this, uri)
+                if (d != null && d.canRead()) docCache[path] = d
+            } catch (e: Exception) {
+            }
+        }
+    }
     override fun onDestroy() {
         pool?.shutdownNow()
         super.onDestroy()
     }
-
     private fun hasAccess(): Boolean =
         if (Build.VERSION.SDK_INT >= 30) {
             Environment.isExternalStorageManager()
@@ -126,7 +130,6 @@ class MainActivity : Activity() {
             checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
                 checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
-
     private fun askAccess() {
         if (Build.VERSION.SDK_INT < 30 && !requested) {
             requested = true
@@ -144,7 +147,6 @@ class MainActivity : Activity() {
             .setOnDismissListener { asking = false }
             .show()
     }
-
     private fun openSettings() {
         try {
             val action = if (Build.VERSION.SDK_INT >= 30) Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION
@@ -154,29 +156,21 @@ class MainActivity : Activity() {
             startActivity(Intent(Settings.ACTION_SETTINGS))
         }
     }
-
-    // ───────────────────────── small UI helpers ─────────────────────────
-
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
-
     private fun box(color: Int, r: Int, stroke: Int = 0): GradientDrawable = GradientDrawable().apply {
         setColor(color)
         cornerRadius = dp(r).toFloat()
         if (stroke != 0) setStroke(dp(1), stroke)
     }
-
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
-
     private fun tv(text: String, sp: Float, color: Int, bold: Boolean = false): TextView = TextView(this).apply {
         this.text = text
         textSize = sp
         setTextColor(color)
         if (bold) typeface = Typeface.DEFAULT_BOLD
     }
-
     private fun lp(w: Int, h: Int, weight: Float = 0f, mh: Int = 0, mt: Int = 0, mb: Int = 0) =
         LinearLayout.LayoutParams(w, h, weight).apply { setMargins(dp(mh), dp(mt), dp(mh), dp(mb)) }
-
     private fun chip(text: String, color: Int = C.TEXT, bg: Int = C.CARD, onClick: () -> Unit): TextView =
         tv(text, 13f, color, true).apply {
             gravity = Gravity.CENTER
@@ -184,7 +178,6 @@ class MainActivity : Activity() {
             background = box(bg, 12, C.STROKE)
             setOnClickListener { onClick() }
         }
-
     private fun stat(title: String, value: String, sub: String, color: Int): View {
         val c = LinearLayout(this)
         c.orientation = LinearLayout.VERTICAL
@@ -195,16 +188,12 @@ class MainActivity : Activity() {
         c.addView(tv(sub, 10f, C.SUB))
         return c
     }
-
-    // ───────────────────────── screen layout ─────────────────────────
-
     private fun buildUi(): View {
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(C.BG)
         root.layoutDirection = View.LAYOUT_DIRECTION_RTL
         root.setPadding(dp(10), dp(10), dp(10), 0)
-
         val head = LinearLayout(this)
         head.gravity = Gravity.CENTER_VERTICAL
         head.addView(tv("🗂️ خريطة المساحة", 20f, C.TEXT, true), lp(0, WRAP, 1f))
@@ -214,7 +203,6 @@ class MainActivity : Activity() {
         }, lp(WRAP, WRAP, 0f, 3))
         head.addView(chip("🗑 المهملات") { showTrash() }, lp(WRAP, WRAP, 0f, 3))
         root.addView(head, lp(MATCH, WRAP, 0f, 0, 0, 8))
-
         crumbScroll = HorizontalScrollView(this)
         crumbScroll.layoutDirection = View.LAYOUT_DIRECTION_LTR
         crumbScroll.isHorizontalScrollBarEnabled = false
@@ -228,14 +216,11 @@ class MainActivity : Activity() {
         pathRow.addView(crumbScroll, lp(0, WRAP, 1f))
         pathRow.addView(chip("📋 نسخ") { copyPath() }, lp(WRAP, WRAP, 0f, 4))
         root.addView(pathRow, lp(MATCH, WRAP, 0f, 0, 0, 8))
-
         stats = LinearLayout(this)
         root.addView(stats, lp(MATCH, WRAP, 0f, 0, 0, 8))
-
         distBar = LinearLayout(this)
         distBar.background = box(C.TRACK, 6)
         root.addView(distBar, lp(MATCH, dp(14), 0f, 0, 0, 8))
-
         sortBtn = chip("") {
             sortMode = (sortMode + 1) % 3
             refresh()
@@ -245,12 +230,16 @@ class MainActivity : Activity() {
         tools.addView(sortBtn, lp(0, WRAP, 1f, 3))
         tools.addView(selAllBtn, lp(0, WRAP, 1f, 3))
         root.addView(tools, lp(MATCH, WRAP, 0f, 0, 0, 6))
-
+        safBtn = chip("🔓 منح وصول لهذا المجلد", C.BG, C.CYAN) { askSafGrant() }
+        safBtn.visibility = View.GONE
+        root.addView(safBtn, lp(MATCH, WRAP, 0f, 0, 0, 6))
+        safTip = tv("📂 معروض بإذن ممنوح يدوياً — عرض وفتح فقط، بدون تحديد أو حذف حالياً", 11f, C.SUB)
+        safTip.visibility = View.GONE
+        root.addView(safTip, lp(MATCH, WRAP, 0f, 0, 0, 6))
         busy = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
         busy.isIndeterminate = true
         busy.visibility = View.GONE
         root.addView(busy, lp(MATCH, dp(4), 0f, 0, 0, 4))
-
         list = ListView(this)
         list.divider = null
         list.dividerHeight = 0
@@ -262,12 +251,10 @@ class MainActivity : Activity() {
             true
         }
         root.addView(list, lp(MATCH, 0, 1f))
-
         emptyView = tv("", 15f, C.SUB)
         emptyView.gravity = Gravity.CENTER
         emptyView.visibility = View.GONE
         root.addView(emptyView, lp(MATCH, 0, 1f))
-
         selBar = LinearLayout(this)
         selBar.gravity = Gravity.CENTER_VERTICAL
         selBar.background = box(C.CARD, 14, C.CYAN)
@@ -282,10 +269,8 @@ class MainActivity : Activity() {
         selBar.addView(chip("🗑 حذف", C.TEXT, C.RED) { askDelete() }, lp(WRAP, WRAP, 0f, 3))
         selBar.visibility = View.GONE
         root.addView(selBar, lp(MATCH, WRAP, 0f, 0, 4, 8))
-
         return root
     }
-
     private fun refreshCrumbs() {
         crumbs.removeAllViews()
         val parts = cur.absolutePath.split("/").filter { it.isNotEmpty() }
@@ -298,7 +283,6 @@ class MainActivity : Activity() {
         }
         crumbScroll.post { crumbScroll.fullScroll(View.FOCUS_RIGHT) }
     }
-
     private fun addCrumb(label: String, target: File, last: Boolean) {
         val t = tv(label, 14f, if (last) C.BG else C.TEXT, true)
         t.setPadding(dp(10), dp(6), dp(10), dp(6))
@@ -306,22 +290,18 @@ class MainActivity : Activity() {
         t.setOnClickListener { go(target) }
         crumbs.addView(t)
     }
-
     private fun copyPath() {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("path", cur.absolutePath))
         toast("تم نسخ المسار: " + cur.absolutePath)
     }
-
-    // ───────────────────────── navigation & scanning ─────────────────────────
-
     private fun go(dir: File) {
         cur = dir
+        curDoc = docCache[dir.path]
         selected.clear()
         load()
         list.setSelection(0)
     }
-
     @Suppress("OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         val parent = cur.parentFile
@@ -335,34 +315,46 @@ class MainActivity : Activity() {
             else -> super.onBackPressed()
         }
     }
-
     private fun load() {
         gen++
         val myGen = gen
         pool?.shutdownNow()
         ui.removeCallbacks(refreshRun)
         scheduled = false
-
-        val kids = cur.listFiles()
-        protectedDir = kids == null ||
-            (kids.isEmpty() && (cur.path.endsWith("/Android/data") || cur.path.endsWith("/Android/obb")))
         entries = ArrayList()
-        kids?.forEach { entries.add(disk.entry(it)) }
+        val d = curDoc
+        if (d != null) {
+            protectedDir = false
+            val kids = try {
+                d.listFiles()
+            } catch (e: Exception) {
+                null
+            }
+            kids?.forEach { c ->
+                val name = c.name ?: return@forEach
+                val cf = File(cur, name)
+                docCache[cf.path] = c
+                entries.add(disk.entryDoc(c, cf))
+            }
+        } else {
+            val kids = cur.listFiles()
+            protectedDir = kids == null ||
+                (kids.isEmpty() && (cur.path.endsWith("/Android/data") || cur.path.endsWith("/Android/obb")))
+            kids?.forEach { entries.add(disk.entry(it)) }
+        }
         refreshCrumbs()
-
         val todo = entries.filter { it.size < 0 }
         pending = todo.size
         busy.visibility = if (pending > 0) View.VISIBLE else View.GONE
         refresh()
         if (todo.isEmpty()) return
-
         val p = Executors.newFixedThreadPool(4)
         pool = p
         for (e in todo) {
             p.execute {
                 var s = 0L
                 try {
-                    s = disk.size(e.file)
+                    s = if (e.doc != null) disk.sizeDoc(e.doc, e.file.path) else disk.size(e.file)
                 } catch (x: InterruptedException) {
                     return@execute
                 } catch (x: Exception) {
@@ -383,14 +375,12 @@ class MainActivity : Activity() {
         }
         p.shutdown()
     }
-
     private fun scheduleRefresh() {
         if (!scheduled) {
             scheduled = true
             ui.postDelayed(refreshRun, 300)
         }
     }
-
     private fun refresh() {
         when (sortMode) {
             0 -> entries.sortWith(compareByDescending<Entry> { it.size })
@@ -398,10 +388,8 @@ class MainActivity : Activity() {
             else -> entries.sortWith(compareBy<Entry> { it.file.name.lowercase() })
         }
         sortBtn.text = arrayOf("⇅ الأكبر أولاً", "⇅ الأصغر أولاً", "⇅ حسب الاسم")[sortMode]
-
         val known = entries.filter { it.size > 0 }.sumOf { it.size }
         adapter.total = if (known > 0) known else 1L
-
         var free = 0L
         var total = 0L
         try {
@@ -427,7 +415,6 @@ class MainActivity : Activity() {
             stat("المتاح بالجهاز", if (total > 0) Fmt.size(free) else "—", if (total > 0) "من " + Fmt.size(total) else "", C.GREEN),
             lp(0, WRAP, 1f, 3)
         )
-
         distBar.removeAllViews()
         if (known > 0) {
             val top = entries.filter { it.size > 0 }.sortedByDescending { it.size }.take(6)
@@ -444,27 +431,27 @@ class MainActivity : Activity() {
                 distBar.addView(seg, lp(0, MATCH, (known - used).toFloat() / known * 100f, 1))
             }
         }
-
         val empty = entries.isEmpty()
         list.visibility = if (empty) View.GONE else View.VISIBLE
         emptyView.visibility = if (empty) View.VISIBLE else View.GONE
         emptyView.text = if (protectedDir) {
-            "🔒\nهذا المجلد محمي من النظام\nأندرويد يمنع جميع التطبيقات من قراءة\nAndroid/data و Android/obb"
+            "🔒\nهذا المجلد محمي من النظام\nجرّب زرار «منح وصول» تحت لو عايز تفتحه"
         } else {
             "📭\nالمجلد فارغ"
         }
+        safBtn.visibility = if (protectedDir && curDoc == null) View.VISIBLE else View.GONE
+        safTip.visibility = if (curDoc != null) View.VISIBLE else View.GONE
         adapter.notifyDataSetChanged()
         updateSel()
     }
-
     private fun clickEntry(e: Entry) {
-        if (e.kind == Kind.FOLDER) go(e.file) else openFile(e.file)
+        if (e.kind == Kind.FOLDER) go(e.file) else openFile(e)
     }
-
-    private fun openFile(f: File) {
+    private fun openFile(en: Entry) {
         try {
-            val uri = FileProvider.getUriForFile(this, "$packageName.provider", f)
-            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase()) ?: "*/*"
+            val d = en.doc
+            val uri = d?.uri ?: FileProvider.getUriForFile(this, "$packageName.provider", en.file)
+            val mime = d?.type ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(en.file.extension.lowercase()) ?: "*/*"
             val i = Intent(Intent.ACTION_VIEW)
             i.setDataAndType(uri, mime)
             i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -473,17 +460,85 @@ class MainActivity : Activity() {
             toast("لا يوجد تطبيق يفتح هذا النوع من الملفات")
         }
     }
-
-    // ───────────────────────── selection & deletion ─────────────────────────
-
+    private fun askSafGrant() {
+        AlertDialog.Builder(this)
+            .setTitle("منح وصول لهذا المجلد")
+            .setMessage(
+                "هتتفتح شاشة اختيار مجلد من النظام.\n" +
+                    "ادخل بالظبط على مجلد «" + cur.name + "» (جوه نفس المكان اللي إنت فاتحه دلوقتي) واضغط «استخدام هذا المجلد».\n\n" +
+                    "ملحوظة: أندرويد أحياناً بيمنع زرار «استخدام هذا المجلد» من العمل مع مجلدات زي Android/data أو Android/obb حسب إصدار نظام جهازك، فممكن محصلش."
+            )
+            .setPositiveButton("فتح شاشة الاختيار") { _, _ -> launchSafPicker() }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+    private fun launchSafPicker() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        i.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        )
+        try {
+            i.putExtra(DocumentsContract.EXTRA_INITIAL_URI, Saf.initialAndroidUri())
+        } catch (e: Exception) {
+        }
+        try {
+            startActivityForResult(i, REQ_SAF)
+        } catch (e: Exception) {
+            toast("تعذر فتح شاشة اختيار المجلد")
+        }
+    }
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_SAF) return
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
+            toast("اتلغى اختيار المجلد")
+            return
+        }
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        } catch (e: Exception) {
+        }
+        val path = Saf.realPath(uri)
+        if (path == null) {
+            toast("تعذر التأكد من مسار المجلد اللي اخترته")
+            return
+        }
+        if (path != cur.path) {
+            toast("اخترت «" + File(path).name + "» مش نفس المجلد اللي إنت فاتحه (" + cur.name + "). جرب تاني واختار بالظبط نفس المجلد.")
+            return
+        }
+        val d = DocumentFile.fromTreeUri(this, uri)
+        if (d == null || !d.canRead()) {
+            toast("التطبيق مش قادر يقرأ هذا المجلد")
+            return
+        }
+        Saf.save(this, path, uri)
+        docCache[path] = d
+        curDoc = d
+        toast("تم ✅ هتقدر تتصفح المجلد دلوقتي")
+        load()
+    }
     private fun toggle(e: Entry) {
+        if (e.doc != null) {
+            toast("التحديد والحذف غير مدعومين هنا حالياً")
+            return
+        }
         val k = e.file.path
         if (!selected.remove(k)) selected.add(k)
         updateSel()
         adapter.notifyDataSetChanged()
     }
-
     private fun toggleAll() {
+        if (curDoc != null) {
+            toast("التحديد والحذف غير مدعومين هنا حالياً")
+            return
+        }
         if (selected.size == entries.size) {
             selected.clear()
         } else {
@@ -492,7 +547,6 @@ class MainActivity : Activity() {
         updateSel()
         adapter.notifyDataSetChanged()
     }
-
     private fun updateSel() {
         val n = selected.size
         selBar.visibility = if (n > 0) View.VISIBLE else View.GONE
@@ -502,7 +556,6 @@ class MainActivity : Activity() {
         }
         selAllBtn.text = if (n > 0 && n == entries.size) "☐ إلغاء التحديد" else "☑ تحديد الكل"
     }
-
     private fun askDelete() {
         val items = entries.filter { selected.contains(it.file.path) }
         if (items.isEmpty()) return
@@ -519,7 +572,6 @@ class MainActivity : Activity() {
             .setNeutralButton("إلغاء", null)
             .show()
     }
-
     private fun doDelete(items: List<Entry>, permanent: Boolean) {
         pool?.shutdownNow()
         busy.visibility = View.VISIBLE
@@ -553,7 +605,6 @@ class MainActivity : Activity() {
             }
         }.start()
     }
-
     private fun showTrash() {
         val boxes = (Trash.dir().listFiles()?.filter { it.isDirectory } ?: emptyList()).sortedBy { it.name }
         if (boxes.isEmpty()) {
@@ -573,7 +624,6 @@ class MainActivity : Activity() {
             .setNeutralButton("تفريغ الكل") { _, _ -> trashAct(boxes, BooleanArray(boxes.size) { true }, false) }
             .show()
     }
-
     private fun trashAct(boxes: List<File>, chk: BooleanArray, restore: Boolean) {
         val sel = boxes.filterIndexed { i, _ -> chk[i] }
         if (sel.isEmpty()) return
@@ -591,9 +641,6 @@ class MainActivity : Activity() {
             }
         }.start()
     }
-
-    // ───────────────────────── list rows ─────────────────────────
-
     private inner class Holder {
         val root = FrameLayout(this@MainActivity)
         val card = LinearLayout(this@MainActivity)
@@ -605,7 +652,6 @@ class MainActivity : Activity() {
         val track = LinearLayout(this@MainActivity)
         val fill = View(this@MainActivity)
         val rest = View(this@MainActivity)
-
         init {
             root.setPadding(0, dp(4), 0, dp(4))
             card.gravity = Gravity.CENTER_VERTICAL
@@ -619,18 +665,15 @@ class MainActivity : Activity() {
             track.background = box(C.TRACK, 4)
             track.addView(fill)
             track.addView(rest)
-
             val top = LinearLayout(this@MainActivity)
             top.gravity = Gravity.CENTER_VERTICAL
             top.addView(name, lp(0, WRAP, 1f))
             top.addView(pct, lp(WRAP, WRAP, 0f, 4))
-
             val col = LinearLayout(this@MainActivity)
             col.orientation = LinearLayout.VERTICAL
             col.addView(top, lp(MATCH, WRAP))
             col.addView(meta, lp(MATCH, WRAP, 0f, 0, 2, 4))
             col.addView(track, lp(MATCH, dp(8)))
-
             card.addView(check, lp(WRAP, WRAP, 0f, 2))
             card.addView(icon, lp(dp(48), dp(48), 0f, 8))
             card.addView(col, lp(0, WRAP, 1f, 4))
@@ -638,16 +681,16 @@ class MainActivity : Activity() {
             root.tag = this
         }
     }
-
     private fun bind(h: Holder, e: Entry) {
         val sel = selected.contains(e.file.path)
         h.card.background = box(if (sel) C.CARD_SEL else C.CARD, 14, if (sel) C.CYAN else C.STROKE)
         h.check.isChecked = sel
         h.check.setOnClickListener { toggle(e) }
+        h.check.visibility = if (e.doc != null) View.INVISIBLE else View.VISIBLE
+        h.check.isEnabled = e.doc == null
         h.icon.text = e.kind.icon
         h.icon.background = box((e.kind.color and 0x00FFFFFF) or 0x33000000, 12)
         h.name.text = if (e.file.name.isEmpty()) e.file.path else e.file.name
-
         val p = if (e.size < 0) 0.0 else e.size * 100.0 / adapter.total
         val col = if (p < 15) C.GREEN else if (p < 40) C.AMBER else C.RED
         h.meta.text = when {
@@ -658,13 +701,11 @@ class MainActivity : Activity() {
         }
         h.pct.text = if (e.size < 0) "…" else String.format(Locale.US, "%.1f%%", p)
         h.pct.setTextColor(col)
-
         val w = if (e.size < 0) 0f else maxOf(p.toFloat(), 1.5f)
         h.fill.background = box(col, 4)
         h.fill.layoutParams = LinearLayout.LayoutParams(0, MATCH, w)
         h.rest.layoutParams = LinearLayout.LayoutParams(0, MATCH, maxOf(100f - w, 0.01f))
     }
-
     private inner class Adapter : BaseAdapter() {
         var total = 1L
         override fun getCount(): Int = entries.size
