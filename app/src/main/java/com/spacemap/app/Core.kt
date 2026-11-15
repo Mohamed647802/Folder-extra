@@ -1,11 +1,13 @@
 package com.spacemap.app
-
+import android.content.Context
+import android.net.Uri
 import android.os.Environment
+import android.provider.DocumentsContract
+import androidx.documentfile.provider.DocumentFile
 import java.io.File
 import java.nio.file.Files
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
-
 object Fmt {
     fun size(b: Long): String {
         if (b < 1024L) return "$b B"
@@ -19,7 +21,6 @@ object Fmt {
         return String.format(Locale.US, "%.1f %s", v, units[i])
     }
 }
-
 enum class Kind(val icon: String, val color: Int, val label: String) {
     FOLDER("📁", 0xFF3B82F6.toInt(), "مجلد"),
     IMAGE("🖼️", 0xFF10B981.toInt(), "صورة"),
@@ -30,10 +31,9 @@ enum class Kind(val icon: String, val color: Int, val label: String) {
     APK("📱", 0xFF22C55E.toInt(), "تطبيق"),
     OTHER("📎", 0xFF64748B.toInt(), "ملف")
 }
-
-fun kindOf(f: File): Kind {
-    if (f.isDirectory) return Kind.FOLDER
-    return when (f.extension.lowercase()) {
+fun kindOf(name: String, isDir: Boolean): Kind {
+    if (isDir) return Kind.FOLDER
+    return when (name.substringAfterLast('.', "").lowercase()) {
         "jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "svg", "dng", "raw" -> Kind.IMAGE
         "mp4", "mkv", "avi", "mov", "3gp", "webm", "flv", "wmv", "m4v" -> Kind.VIDEO
         "mp3", "wav", "aac", "flac", "ogg", "m4a", "opus", "amr", "wma" -> Kind.AUDIO
@@ -43,18 +43,21 @@ fun kindOf(f: File): Kind {
         else -> Kind.OTHER
     }
 }
-
-/** size = -1 means "still being calculated" */
-class Entry(val file: File, val kind: Kind, var size: Long, val count: Int, val locked: Boolean)
-
+fun kindOf(f: File): Kind = kindOf(f.name, f.isDirectory)
+class Entry(
+    val file: File,
+    val kind: Kind,
+    var size: Long,
+    val count: Int,
+    val locked: Boolean,
+    val doc: DocumentFile? = null
+)
 object Fs {
     fun isLink(f: File): Boolean = try {
         Files.isSymbolicLink(f.toPath())
     } catch (e: Exception) {
         false
     }
-
-    /** Deletes a file or a whole folder tree (never follows symlinks). */
     fun deleteTree(f: File): Boolean {
         var ok = true
         if (f.isDirectory && !isLink(f)) {
@@ -63,8 +66,6 @@ object Fs {
         return (f.delete() || !f.exists()) && ok
     }
 }
-
-/** App's own recycle bin (Android has no system-wide trash for arbitrary folders). */
 object Trash {
     fun dir(): File {
         val d = File(Environment.getExternalStorageDirectory(), ".SpaceMapTrash")
@@ -75,14 +76,11 @@ object Trash {
         }
         return d
     }
-
     fun orig(box: File): String = try {
         File(box, "orig.txt").readText()
     } catch (e: Exception) {
         box.name
     }
-
-    /** Moves f into the trash. Returns the new location, or null on failure. */
     fun moveIn(f: File): File? {
         try {
             if ((dir().absolutePath + "/").startsWith(f.absolutePath + "/")) return null
@@ -98,7 +96,6 @@ object Trash {
         }
         return null
     }
-
     fun restore(box: File): Boolean {
         try {
             val src = File(box, "data").listFiles()?.firstOrNull() ?: return false
@@ -119,19 +116,55 @@ object Trash {
         }
     }
 }
-
+// Storage Access Framework: صلاحيات يمنحها المستخدم يدوياً لمجلدات أندرويد بيمنع القراءة المباشرة ليها
+// (زي Android/data و Android/obb)، بتتحفظ عشان ما تتكررش في كل مرة يفتح فيها التطبيق.
+object Saf {
+    private const val PREF = "saf_grants"
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+    fun save(ctx: Context, realPath: String, uri: Uri) {
+        prefs(ctx).edit().putString(realPath, uri.toString()).apply()
+    }
+    fun all(ctx: Context): Map<String, Uri> =
+        prefs(ctx).all.mapNotNull { (k, v) ->
+            if (v is String) try {
+                k to Uri.parse(v)
+            } catch (e: Exception) {
+                null
+            } else null
+        }.toMap()
+    fun realPath(uri: Uri): String? = try {
+        val docId = DocumentsContract.getTreeDocumentId(uri)
+        val parts = docId.split(":", limit = 2)
+        if (parts.size == 2 && parts[0] == "primary") {
+            val rel = parts[1]
+            val base = Environment.getExternalStorageDirectory().path
+            if (rel.isEmpty()) base else "$base/$rel"
+        } else null
+    } catch (e: Exception) {
+        null
+    }
+    fun initialAndroidUri(): Uri =
+        Uri.parse("content://com.android.externalstorage.documents/document/primary%3AAndroid")
+}
 class Disk {
     val cache = ConcurrentHashMap<String, Long>()
     private val skip = setOf("/proc", "/sys", "/dev")
-
     fun entry(f: File): Entry {
         if (!f.isDirectory) return Entry(f, kindOf(f), f.length(), 0, false)
         val l = f.list()
         val size = if (l == null) 0L else (cache[f.path] ?: -1L)
         return Entry(f, Kind.FOLDER, size, l?.size ?: 0, l == null)
     }
-
-    /** Total size of f (recursive). Every folder size found on the way is cached. */
+    fun entryDoc(d: DocumentFile, f: File): Entry {
+        if (!d.isDirectory) return Entry(f, kindOf(f.name, false), d.length(), 0, false, d)
+        val kids = try {
+            d.listFiles()
+        } catch (e: Exception) {
+            null
+        }
+        val size = if (kids == null) 0L else (cache[f.path] ?: -1L)
+        return Entry(f, Kind.FOLDER, size, kids?.size ?: 0, kids == null, d)
+    }
     fun size(f: File): Long {
         if (Thread.currentThread().isInterrupted) throw InterruptedException()
         if (!f.isDirectory) return f.length()
@@ -146,14 +179,30 @@ class Disk {
         cache[key] = total
         return total
     }
-
+    fun sizeDoc(d: DocumentFile, path: String): Long {
+        if (Thread.currentThread().isInterrupted) throw InterruptedException()
+        if (!d.isDirectory) return d.length()
+        val hit = cache[path]
+        if (hit != null) return hit
+        val kids = try {
+            d.listFiles()
+        } catch (e: Exception) {
+            null
+        } ?: return 0L
+        var total = 0L
+        for (k in kids) {
+            val name = k.name ?: continue
+            total += sizeDoc(k, "$path/$name")
+        }
+        cache[path] = total
+        return total
+    }
     fun removed(f: File, size: Long) {
         val p = f.path
         val dead = cache.keys.filter { it == p || it.startsWith("$p/") }
         for (k in dead) cache.remove(k)
         adjust(f.parentFile, -size)
     }
-
     fun adjust(d: File?, delta: Long) {
         var x = d
         while (x != null) {
